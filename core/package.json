@@ -1,0 +1,20 @@
+{
+  "name": "core",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@aws-sdk/client-ecs": "^3.891.0",
+    "express": "^5.1.0",
+    "random-word-slugs": "^0.1.7"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3"
+  }
+}
