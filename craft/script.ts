@@ -5,8 +5,11 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 import mime from 'mime-types'
 import * as fs from 'fs'
 import { promisify } from 'util'
+import Redis from 'ioredis'
 
 const execAsync = promisify(exec)
+
+const publisher = new Redis(process.env.REDIS_URL || '')
 
 const s3Client = new S3Client({
     region: process.env.AWS_REGION || '',
@@ -18,33 +21,38 @@ const s3Client = new S3Client({
 
 const PROJECT_ID = process.env.PROJECT_ID
 
+function publishLog(log: string) {
+    publisher.publish(`logs:${PROJECT_ID}`, JSON.stringify({ log }))
+}
+
 async function init() {
 	try {
-		console.log('Executing script.js')
+		publishLog('Executing script.js')
 		const outDirPath = path.join(__dirname, 'output')
 
 		// Check if output directory exists
 		try {
 			await fs.promises.access(outDirPath)
 		} catch (error) {
+			publishLog(`Error: Output directory does not exist: ${outDirPath}`)
 			throw new Error(`Output directory does not exist: ${outDirPath}`)
 		}
 
-		console.log('Starting build process...')
+		publishLog('Starting build process...')
 		const { stdout, stderr } = await execAsync(`cd ${outDirPath} && npm install && npm run build`)
 		
 		if (stdout) {
-			console.log('Build output:', stdout)
+			publishLog(`Build output: ${stdout}`)
 		}
 		if (stderr) {
-			console.error('Build warnings/errors:', stderr)
+			publishLog(`Build warnings/errors: ${stderr}`)
 		}
 
-		console.log('Build Complete')
+		publishLog('Build Complete')
 		await uploadFiles()
 		
 	} catch (error) {
-		console.error('Fatal error in init:', error)
+		publishLog(`Fatal error in init: ${error}`)
 		process.exit(1)
 	}
 }
@@ -57,15 +65,16 @@ async function uploadFiles() {
 		try {
 			await fs.promises.access(distFolderPath)
 		} catch (error) {
+			publishLog(`Error: Dist directory does not exist: ${distFolderPath}`)
 			throw new Error(`Dist directory does not exist: ${distFolderPath}`)
 		}
 
-		console.log('Discovering files to upload...')
+		publishLog('Discovering files to upload...')
 		const filesToUpload = await getFilesToUpload(distFolderPath)
-		console.log(`Found ${filesToUpload.length} files to upload`)
+		publishLog(`Found ${filesToUpload.length} files to upload`)
 
 		if (filesToUpload.length === 0) {
-			console.log('No files found to upload')
+			publishLog('No files found to upload')
 			return
 		}
 
@@ -85,12 +94,12 @@ async function uploadFiles() {
 					completed++
 				} catch (error) {
 					failed++
-					console.error(`Failed to upload ${filesToUpload[currentIndex]}:`, error)
+					publishLog(`Failed to upload ${filesToUpload[currentIndex]}: ${error}`)
 				}
 				
 				// Progress logging
 				if ((completed + failed) % 10 === 0 || (completed + failed) === filesToUpload.length) {
-					console.log(`Progress: ${completed + failed}/${filesToUpload.length} files processed (${completed} success, ${failed} failed)`)
+					publishLog(`Progress: ${completed + failed}/${filesToUpload.length} files processed (${completed} success, ${failed} failed)`)
 				}
 			}
 		}
@@ -98,14 +107,14 @@ async function uploadFiles() {
 		const workerCount = Math.min(CONCURRENCY, filesToUpload.length)
 		await Promise.all(Array.from({ length: workerCount }, () => worker()))
 		
-		console.log(`Upload complete! Success: ${completed}, Failed: ${failed}`)
+		publishLog(`Upload complete! Success: ${completed}, Failed: ${failed}`)
 		
 		if (failed > 0) {
-			console.warn(`${failed} files failed to upload. Check logs above for details.`)
+			publishLog(`Warning: ${failed} files failed to upload. Check logs above for details.`)
 		}
 		
 	} catch (error) {
-		console.error('Error in uploadFiles:', error)
+		publishLog(`Error in uploadFiles: ${error}`)
 		throw error
 	}
 }
@@ -131,7 +140,7 @@ async function getFilesToUpload(distFolderPath: string): Promise<string[]> {
 					}
 					return null
 				} catch (error) {
-					console.error(`Error processing file ${item}:`, error)
+					publishLog(`Error processing file ${item}: ${error}`)
 					return null
 				}
 			})
@@ -142,7 +151,7 @@ async function getFilesToUpload(distFolderPath: string): Promise<string[]> {
 
 		return filesToUpload
 	} catch (error) {
-		console.error('Error getting files to upload:', error)
+		publishLog(`Error getting files to upload: ${error}`)
 		throw error
 	}
 }
@@ -154,7 +163,7 @@ async function uploadOne(filePathStr: string, distFolderPath: string) {
 		// Verify file exists before attempting upload
 		await fs.promises.access(absPath)
 		
-		console.log('uploading', filePathStr)
+		publishLog(`Uploading ${filePathStr}`)
 		const command = new PutObjectCommand({
 			Bucket: 'n0tvercel-outputs',
 			Key: `__outputs/${PROJECT_ID}/${filePathStr}`,
@@ -163,10 +172,10 @@ async function uploadOne(filePathStr: string, distFolderPath: string) {
 		})
 		
 		await s3Client.send(command)
-		console.log('uploaded', filePathStr)
+		publishLog(`Uploaded ${filePathStr}`)
 		
 	} catch (error) {
-		console.error(`Error uploading ${filePathStr}:`, error)
+		publishLog(`Error uploading ${filePathStr}: ${error}`)
 		throw error
 	}
 }
