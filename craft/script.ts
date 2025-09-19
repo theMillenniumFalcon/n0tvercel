@@ -1,3 +1,4 @@
+import 'dotenv/config'
 import { exec } from 'child_process'
 import path from 'path'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
@@ -8,11 +9,11 @@ import { promisify } from 'util'
 const execAsync = promisify(exec)
 
 const s3Client = new S3Client({
-    region: '',
+    region: process.env.AWS_REGION || '',
     credentials: {
-        accessKeyId: '',
-        secretAccessKey: ''
-    }
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
+    },
 })
 
 const PROJECT_ID = process.env.PROJECT_ID
