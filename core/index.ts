@@ -86,7 +86,7 @@ const client = createClient({
     host: process.env.CLICKHOUSE_HOST,
     database: process.env.CLICKHOUSE_DATABASE,
     username: process.env.CLICKHOUSE_USERNAME,
-    password: process.env.CLICKHOUSE_PASSWORD || ''
+    password: process.env.CLICKHOUSE_PASSWORD
 })
 
 const consumer = kafka.consumer({ groupId: 'core-logs-consumer' })
