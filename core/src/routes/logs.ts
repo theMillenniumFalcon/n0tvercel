@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express'
 import z from 'zod'
 import { clickhouseClient } from '../services/database'
 import { asyncHandler } from '../middleware'
-import { LogsResponse } from '../types'
+import { LogsResponse, LogEntry } from '../types'
 
 const router = Router()
 
@@ -30,7 +30,7 @@ router.get('/logs/:id', asyncHandler(async (req: Request, res: Response) => {
         format: 'JSONEachRow'
     })
 
-    const rawLogs = await logs.json()
+    const rawLogs = await logs.json() as LogEntry[]
 
     const response: LogsResponse = { logs: rawLogs }
     return res.json({ status: 'success', data: response })
