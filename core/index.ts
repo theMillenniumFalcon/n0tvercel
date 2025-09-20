@@ -2,14 +2,63 @@ import 'dotenv/config'
 import express, { Request, Response } from 'express'
 import { generateSlug } from 'random-word-slugs'
 import { ECSClient, RunTaskCommand } from '@aws-sdk/client-ecs'
+import { PrismaClient } from '@prisma/client'
 import { Server } from 'socket.io'
 import Redis from 'ioredis'
+import z from 'zod'
 
 const app = express()
 
 app.use(express.json({ limit: '1mb' }))
 app.use(express.urlencoded({ extended: true, limit: '1mb' }))
+
+// Error handling middleware
+app.use((err: Error, req: Request, res: Response, next: any) => {
+    console.error('Unhandled error:', err)
+    
+    if (err.name === 'ValidationError') {
+        return res.status(400).json({
+            error: 'Validation failed',
+            message: err.message
+        })
+    }
+    
+    if (err.name === 'PrismaClientKnownRequestError') {
+        return res.status(400).json({
+            error: 'Database error',
+            message: 'Invalid request to database'
+        })
+    }
+    
+    if (err.name === 'PrismaClientUnknownRequestError') {
+        return res.status(500).json({
+            error: 'Database error',
+            message: 'Unknown database error occurred'
+        })
+    }
+    
+    res.status(500).json({
+        error: 'Internal server error',
+        message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+    })
+})
+
+// Async error wrapper
+const asyncHandler = (fn: Function) => (req: Request, res: Response, next: any) => {
+    Promise.resolve(fn(req, res, next)).catch(next)
+}
+
 const PORT: number = Number(process.env.PORT ?? 9000)
+
+const prisma = new PrismaClient({
+    datasources: {
+        db: {
+            url: process.env.DATABASE_URL
+        }
+    },
+    log: ['error', 'warn'],
+    errorFormat: 'pretty'
+})
 
 const subscriber = new Redis(process.env.REDIS_URL || '', {
     maxRetriesPerRequest: 3,
@@ -61,13 +110,55 @@ const config = {
     SECURITY_GROUPS: (process.env.ECS_SECURITY_GROUPS || '').split(',').filter(Boolean)
 }
 
-app.post('/project', async (req: Request, res: Response) => {
-	const { gitURL, slug }: { gitURL?: string; slug?: string } = req.body || {}
-	if (!gitURL || typeof gitURL !== 'string') {
-		return res.status(400).json({ error: 'gitURL is required' })
-	}
+app.post('/project', asyncHandler(async (req: Request, res: Response) => {
+    const schema = z.object({
+        name: z.string(),
+        gitURL: z.string()
+    })
+    const safeParseResult = schema.safeParse(req.body)
 
-	const projectSlug: string = slug && typeof slug === 'string' ? slug : generateSlug()
+    if (safeParseResult.error) return res.status(400).json({ error: safeParseResult.error })
+
+    const { name, gitURL } = safeParseResult.data
+
+    const project = await prisma.project.create({
+        data: {
+            name,
+            gitURL,
+            subDomain: generateSlug()
+        }
+    })
+
+    return res.json({ status: 'success', data: { project } })
+}))
+
+app.post('/deploy', asyncHandler(async (req: Request, res: Response) => {
+    const deploySchema = z.object({
+        projectId: z.string().uuid('Invalid project ID format')
+    })
+    
+    const safeParseResult = deploySchema.safeParse(req.body)
+    
+    if (safeParseResult.error) {
+        return res.status(400).json({ 
+            error: 'Validation failed', 
+            details: safeParseResult.error.issues 
+        })
+    }
+    
+    const { projectId } = safeParseResult.data
+
+    const project = await prisma.project.findUnique({ where: { id: projectId } })
+
+    if (!project) return res.status(404).json({ error: 'Project not found' })
+
+    // Check if there is no running deployment
+    const deployment = await prisma.deployment.create({
+        data: {
+            project: { connect: { id: projectId } },
+            status: 'QUEUED',
+        }
+    })
 
     // Prepare ECS task run
     const command = new RunTaskCommand({
@@ -87,8 +178,9 @@ app.post('/project', async (req: Request, res: Response) => {
                 {
                     name: 'craft',
                     environment: [
-                        { name: 'GIT_REPOSITORY__URL', value: gitURL },
-                        { name: 'PROJECT_ID', value: projectSlug }
+                        { name: 'GIT_REPOSITORY__URL', value: project.gitURL },
+                        { name: 'PROJECT_ID', value: projectId },
+                        { name: 'DEPLOYEMENT_ID', value: deployment.id },
                     ]
                 }
             ]
@@ -98,7 +190,7 @@ app.post('/project', async (req: Request, res: Response) => {
 	// Respond immediately and run ECS call in background
 	res.status(202).json({
 		status: 'queued',
-		data: { projectSlug, url: `http://${projectSlug}.localhost:8000` }
+		data: { deploymentId: deployment.id }
 	})
 
     ecsClient.send(command)
@@ -106,10 +198,10 @@ app.post('/project', async (req: Request, res: Response) => {
             console.log('ECS task started successfully:', result.tasks?.[0]?.taskArn)
         })
         .catch((err) => {
-            console.error('RunTask failed', { err, gitURL, projectSlug })
+            console.error('RunTask failed', { err, projectId, deployment })
             // Consider implementing retry logic or dead letter queue
         })
-})
+}))
 
 async function initRedisSubscribe() {
     console.log('Subscribed to logs....')
@@ -133,6 +225,14 @@ async function gracefulShutdown() {
     } catch (err) {
         console.error('Error closing Redis connection:', err)
     }
+    
+    try {
+        await prisma.$disconnect()
+        console.log('Prisma connection closed')
+    } catch (err) {
+        console.error('Error closing Prisma connection:', err)
+    }
+    
     process.exit(0)
 }
 
