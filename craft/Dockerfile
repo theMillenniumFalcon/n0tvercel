@@ -26,6 +26,9 @@ COPY tsconfig.json tsconfig.json
 ## Copy package manifests for dependency install layer caching
 COPY package*.json .
 
+## Copy Kafka SSL certificate for secure connections
+COPY kafka.pem kafka.pem 
+
 ## Install Node dependencies for the project
 RUN npm install
 
