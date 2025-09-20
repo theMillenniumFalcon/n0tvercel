@@ -3,11 +3,20 @@ import express, { Request, Response } from 'express'
 import { generateSlug } from 'random-word-slugs'
 import { ECSClient, RunTaskCommand } from '@aws-sdk/client-ecs'
 import { PrismaClient } from '@prisma/client'
+import { createClient } from '@clickhouse/client'
+import { Kafka } from 'kafkajs'
 import { Server } from 'socket.io'
-import Redis from 'ioredis'
+import { v4 as uuidv4 } from 'uuid'
 import z from 'zod'
+import * as fs from 'fs'
+import path from 'path'
 
 const app = express()
+
+// constants
+const KAFKA_CONFIG = {
+    SASL_MECHANISM: 'plain' as const
+} as const
 
 app.use(express.json({ limit: '1mb' }))
 app.use(express.urlencoded({ extended: true, limit: '1mb' }))
@@ -60,14 +69,27 @@ const prisma = new PrismaClient({
     errorFormat: 'pretty'
 })
 
-const subscriber = new Redis(process.env.REDIS_URL || '', {
-    maxRetriesPerRequest: 3,
-    lazyConnect: true,
-    keepAlive: 30000,
-    connectTimeout: 10000,
-    commandTimeout: 5000,
-    enableReadyCheck: false
+const kafka = new Kafka({
+    clientId: 'api-server',
+    brokers: [process.env.KAFKA_BROKER as string],
+    ssl: {
+        ca: [fs.readFileSync(path.join(__dirname, 'kafka.pem'), 'utf-8')]
+    },
+    sasl: {
+        username: process.env.KAFKA_SASL_USERNAME as string,
+        password: process.env.KAFKA_SASL_PASSWORD as string,
+        mechanism: KAFKA_CONFIG.SASL_MECHANISM
+    }
 })
+
+const client = createClient({
+    host: process.env.CLICKHOUSE_HOST,
+    database: process.env.CLICKHOUSE_DATABASE,
+    username: process.env.CLICKHOUSE_USERNAME,
+    password: process.env.CLICKHOUSE_PASSWORD || ''
+})
+
+const consumer = kafka.consumer({ groupId: 'core-logs-consumer' })
 
 const io = new Server({ 
     cors: { 
@@ -203,15 +225,107 @@ app.post('/deploy', asyncHandler(async (req: Request, res: Response) => {
         })
 }))
 
-async function initRedisSubscribe() {
-    console.log('Subscribed to logs....')
-    subscriber.psubscribe('logs:*')
-    subscriber.on('pmessage', (pattern, channel, message) => {
-        io.to(channel).emit('message', message)
-    })
+async function initKafkaConsumer() {
+    try {
+        console.log('Connecting to Kafka...')
+        await consumer.connect()
+        console.log('Kafka consumer connected successfully')
+        
+        await consumer.subscribe({ topics: ['container-logs'], fromBeginning: true })
+        console.log('Subscribed to container-logs topic')
+
+        await consumer.run({
+            eachBatch: async function ({ batch, heartbeat, commitOffsetsIfNecessary, resolveOffset }) {
+                try {
+                    const messages = batch.messages;
+                    console.log(`Received ${messages.length} messages from topic: ${batch.topic}`)
+                    
+                    const validMessages = messages.filter(msg => msg.value)
+                    if (validMessages.length === 0) {
+                        console.log('No valid messages in batch, skipping')
+                        return;
+                    }
+                    
+                    const logEntries = [];
+                    
+                    for (const message of validMessages) {
+                        try {
+                            const stringMessage = message.value!.toString()
+                            const parsedMessage = JSON.parse(stringMessage)
+                            
+                            // Validate required fields
+                            if (!parsedMessage.DEPLOYEMENT_ID || !parsedMessage.log) {
+                                console.warn('Invalid message format, skipping:', parsedMessage)
+                                resolveOffset(message.offset)
+                                continue;
+                            }
+                            
+                            logEntries.push({
+                                event_id: uuidv4(),
+                                deployment_id: parsedMessage.DEPLOYEMENT_ID,
+                                log: parsedMessage.log,
+                                timestamp: new Date().toISOString()
+                            })
+                            
+                            resolveOffset(message.offset)
+                        } catch (parseError) {
+                            console.error('Error parsing message:', parseError, 'Message:', message.value?.toString())
+                            resolveOffset(message.offset) // Skip this message
+                        }
+                    }
+                    
+                    // Batch insert to ClickHouse
+                    if (logEntries.length > 0) {
+                        try {
+                            const { query_id } = await client.insert({
+                                table: 'log_events',
+                                values: logEntries,
+                                format: 'JSONEachRow'
+                            })
+                            console.log(`Successfully inserted ${logEntries.length} log entries. Query ID: ${query_id}`)
+                        } catch (insertError) {
+                            console.error('Error inserting logs to ClickHouse:', insertError)
+                            // Don't commit offsets if insertion failed
+                            return;
+                        }
+                    }
+                    
+                    // Commit offsets and heartbeat only after successful processing
+                    await commitOffsetsIfNecessary()
+                    await heartbeat()
+                    
+                } catch (batchError) {
+                    console.error('Error processing batch:', batchError)
+                    // Send heartbeat to prevent consumer from being kicked out
+                    try {
+                        await heartbeat()
+                    } catch (heartbeatError) {
+                        console.error('Error sending heartbeat:', heartbeatError)
+                    }
+                }
+            }
+        })
+        
+        console.log('Kafka consumer started successfully')
+        
+    } catch (error) {
+        console.error('Failed to initialize Kafka consumer:', error)
+        // Attempt to disconnect on error
+        try {
+            await consumer.disconnect()
+        } catch (disconnectError) {
+            console.error('Error disconnecting consumer after failure:', disconnectError)
+        }
+        throw error;
+    }
 }
 
-initRedisSubscribe()
+// Initialize Kafka consumer with error handling
+initKafkaConsumer().catch(error => {
+    console.error('Failed to start Kafka consumer:', error)
+    // In production, you might want to restart the process or implement retry logic
+    process.exit(1)
+})
 
 // Graceful shutdown handling
 process.on('SIGTERM', gracefulShutdown)
@@ -219,11 +333,19 @@ process.on('SIGINT', gracefulShutdown)
 
 async function gracefulShutdown() {
     console.log('Shutting down gracefully...')
+    
     try {
-        await subscriber.quit()
-        console.log('Redis connection closed')
+        await consumer.disconnect()
+        console.log('Kafka consumer connection closed')
     } catch (err) {
-        console.error('Error closing Redis connection:', err)
+        console.error('Error closing Kafka consumer connection:', err)
+    }
+    
+    try {
+        await client.close()
+        console.log('ClickHouse connection closed')
+    } catch (err) {
+        console.error('Error closing ClickHouse connection:', err)
     }
     
     try {
